@@ -1,0 +1,12 @@
+[
+    {
+        "name": "VS2026-VCPKG",
+        "visualStudio": "c21c4f91",
+        "visualStudioArchitecture": "x64",
+        "isTrusted": true,
+        "cmakeSettings": {
+            "CMAKE_TOOLCHAIN_FILE": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/vcpkg/scripts/buildsystems/vcpkg.cmake",
+            "VCPKG_TARGET_TRIPLET": "x64-windows-static"
+        }
+    }
+]
