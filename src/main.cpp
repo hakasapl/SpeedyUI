@@ -88,8 +88,8 @@ struct Config {
     bool enabled = true;
     Mode mode = DEFAULT_MODE;
     float targetFPS = static_cast<float>(DEFAULT_TARGET_FPS);
-    SpeedyUI::FileSet allowlist;
-    SpeedyUI::FileSet blocklist;
+    SpeedyUI::PathList allowlist;
+    SpeedyUI::PathList blocklist;
 };
 
 // The hook is called by the game with no context of its own, so its state has to be global
@@ -124,6 +124,26 @@ void setupLog()
 }
 
 /**
+ * @brief Reads sAllowlist or sBlocklist, logging every entry not written relative to Data/Interface
+ *
+ * @param ini Loaded INI
+ * @param key Setting to read
+ * @return The entries that can be used
+ */
+auto readPathList(const CSimpleIniA& ini,
+                  const char* key) -> SpeedyUI::PathList
+{
+    auto parsed = SpeedyUI::parsePathList(ini.GetValue(CONFIG_SECTION, key, ""));
+    for (const auto& entry : parsed.rejected) {
+        spdlog::warn("Ignoring {} entry \"{}\": entries are paths relative to Data/Interface, such as "
+                     "hudmenu.swf or mymenu/main.swf",
+                     key,
+                     entry);
+    }
+    return std::move(parsed.paths);
+}
+
+/**
  * @brief Reads the plugin INI, falling back to the defaults for anything missing
  *
  * @return Settings to run with
@@ -146,8 +166,8 @@ auto loadConfig() -> Config
             spdlog::warn("Ignoring unknown sMode {}, using {}", mode, modeName(DEFAULT_MODE));
         }
     }
-    config.allowlist = SpeedyUI::parseFileList(ini.GetValue(CONFIG_SECTION, "sAllowlist", ""));
-    config.blocklist = SpeedyUI::parseFileList(ini.GetValue(CONFIG_SECTION, "sBlocklist", ""));
+    config.allowlist = readPathList(ini, "sAllowlist");
+    config.blocklist = readPathList(ini, "sBlocklist");
 
     const auto targetFPS = static_cast<float>(ini.GetDoubleValue(CONFIG_SECTION, "fTargetFPS", DEFAULT_TARGET_FPS));
     if (std::isfinite(targetFPS) && targetFPS > 0.0F) {
@@ -162,13 +182,13 @@ auto loadConfig() -> Config
 /**
  * @brief Records that a movie has been seen, so what happens to it is logged once per session
  *
- * @param fileName Lower-case movie filename
+ * @param path Movie path relative to the Interface folder, as the INI lists match it
  * @return True the first time the movie is seen
  */
-auto firstSighting(const std::string& fileName) -> bool
+auto firstSighting(const std::string& path) -> bool
 {
     const std::scoped_lock lock(s_loggedMoviesMutex);
-    return s_loggedMovies.insert(fileName).second;
+    return s_loggedMovies.insert(path).second;
 }
 
 /**
@@ -191,40 +211,40 @@ auto getFrameRateHook(const RE::GFxMovieDefImpl* movieDef) -> float
     const float headerFPS = movieDef->bindTaskData->movieDataResource->loadTaskData->movieInfo.frameRate;
 
     const char* url = movieDef->GetFileURL();
-    const auto fileName = SpeedyUI::fileNameOf(url != nullptr ? url : "");
-    const bool included = SpeedyUI::isIncluded(fileName, s_config.allowlist, s_config.blocklist);
+    const auto path = SpeedyUI::moviePath(url != nullptr ? url : "");
+    const bool included = SpeedyUI::isIncluded(path, s_config.allowlist, s_config.blocklist);
 
     if (s_config.mode == Mode::INTERPOLATED) {
-        const auto summary = SpeedyUI::prepareMovie(*movieDef, fileName, included && s_smoothing);
-        if (!firstSighting(fileName)) {
+        const auto summary = SpeedyUI::prepareMovie(*movieDef, path, included && s_smoothing);
+        if (!firstSighting(path)) {
             return headerFPS;
         }
         if (!included) {
-            spdlog::info("{}: {} FPS, not smoothed (excluded by allowlist or blocklist)", fileName, headerFPS);
+            spdlog::info("{}: {} FPS, not smoothed (excluded by allowlist or blocklist)", path, headerFPS);
         } else if (!s_smoothing) {
-            spdlog::info("{}: {} FPS, not smoothed (smoothing is unavailable)", fileName, headerFPS);
+            spdlog::info("{}: {} FPS, not smoothed (smoothing is unavailable)", path, headerFPS);
         } else {
-            spdlog::info("{}: {} FPS, tweens smoothed in {} of {} timelines", fileName, headerFPS, summary.tweened, summary.timelines);
+            spdlog::info("{}: {} FPS, tweens smoothed in {} of {} timelines", path, headerFPS, summary.tweened, summary.timelines);
         }
         return headerFPS;
     }
 
     if (!included) {
-        if (firstSighting(fileName)) {
-            spdlog::info("{}: left at {} FPS (excluded by allowlist or blocklist)", fileName, headerFPS);
+        if (firstSighting(path)) {
+            spdlog::info("{}: left at {} FPS (excluded by allowlist or blocklist)", path, headerFPS);
         }
         return headerFPS;
     }
 
     if (headerFPS >= s_config.targetFPS) {
-        if (firstSighting(fileName)) {
-            spdlog::info("{}: left at {} FPS (already at or above target)", fileName, headerFPS);
+        if (firstSighting(path)) {
+            spdlog::info("{}: left at {} FPS (already at or above target)", path, headerFPS);
         }
         return headerFPS;
     }
 
-    if (firstSighting(fileName)) {
-        spdlog::info("{}: {} -> {} FPS", fileName, headerFPS, s_config.targetFPS);
+    if (firstSighting(path)) {
+        spdlog::info("{}: {} -> {} FPS", path, headerFPS, s_config.targetFPS);
     }
     return s_config.targetFPS;
 }
