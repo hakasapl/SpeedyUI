@@ -1,6 +1,7 @@
 #include "PCH.h"
 
 #include "Filter.h"
+#include "Smoothing.h"
 
 #include <spdlog/common.h>
 #include <spdlog/logger.h>
@@ -19,7 +20,9 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -48,10 +51,42 @@ constexpr std::array<std::uint8_t, 18> GET_FRAME_RATE_CODE
     = {0x48, 0x8B, 0x41, 0x38, 0x48, 0x8B, 0x48, 0x18, 0x48, 0x8B, 0x41, 0x40, 0xF3, 0x0F, 0x10, 0x40, 0x68, 0xC3};
 
 /**
+ * @brief How menus are made smoother, the INI's sMode
+ */
+enum class Mode : std::uint8_t {
+    FPS, /**< Menus get a higher frame rate, which also speeds them up */
+    INTERPOLATED, /**< Menus keep their frame rate and tweens are drawn between frames */
+};
+
+constexpr Mode DEFAULT_MODE = Mode::INTERPOLATED;
+
+auto modeName(Mode mode) -> const char*
+{
+    return mode == Mode::FPS ? "fps" : "interpolated";
+}
+
+/**
+ * @brief Reads sMode, which is not case-sensitive
+ *
+ * @return The mode, or nothing if the text names none
+ */
+auto parseMode(std::string_view text) -> std::optional<Mode>
+{
+    const auto lowered = SpeedyUI::toLower(text);
+    for (const auto mode : {Mode::FPS, Mode::INTERPOLATED}) {
+        if (lowered == modeName(mode)) {
+            return mode;
+        }
+    }
+    return std::nullopt;
+}
+
+/**
  * @brief Settings read from the INI, never modified after SKSEPluginLoad
  */
 struct Config {
     bool enabled = true;
+    Mode mode = DEFAULT_MODE;
     float targetFPS = static_cast<float>(DEFAULT_TARGET_FPS);
     SpeedyUI::FileSet allowlist;
     SpeedyUI::FileSet blocklist;
@@ -60,6 +95,7 @@ struct Config {
 // The hook is called by the game with no context of its own, so its state has to be global
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 Config s_config;
+bool s_smoothing = false; /**< sMode is interpolated and tweens can be smoothed */
 
 std::mutex s_loggedMoviesMutex;
 std::unordered_set<std::string> s_loggedMovies; /**< Movies already reported, so each is logged once */
@@ -103,6 +139,13 @@ auto loadConfig() -> Config
     }
 
     config.enabled = ini.GetBoolValue(CONFIG_SECTION, "bEnabled", config.enabled);
+    if (const char* mode = ini.GetValue(CONFIG_SECTION, "sMode", nullptr); mode != nullptr) {
+        if (const auto parsed = parseMode(mode)) {
+            config.mode = *parsed;
+        } else {
+            spdlog::warn("Ignoring unknown sMode {}, using {}", mode, modeName(DEFAULT_MODE));
+        }
+    }
     config.allowlist = SpeedyUI::parseFileList(ini.GetValue(CONFIG_SECTION, "sAllowlist", ""));
     config.blocklist = SpeedyUI::parseFileList(ini.GetValue(CONFIG_SECTION, "sBlocklist", ""));
 
@@ -117,30 +160,15 @@ auto loadConfig() -> Config
 }
 
 /**
- * @brief Reports what happened to a movie the first time it is seen
+ * @brief Records that a movie has been seen, so what happens to it is logged once per session
  *
  * @param fileName Lower-case movie filename
- * @param headerFPS Frame rate stored in the movie file
- * @param frameRate Frame rate handed to Scaleform
- * @param included False if the allowlist or blocklist excluded the movie
+ * @return True the first time the movie is seen
  */
-void logMovieOnce(const std::string& fileName,
-                  float headerFPS,
-                  float frameRate,
-                  bool included)
+auto firstSighting(const std::string& fileName) -> bool
 {
     const std::scoped_lock lock(s_loggedMoviesMutex);
-    if (!s_loggedMovies.insert(fileName).second) {
-        return;
-    }
-
-    if (!included) {
-        spdlog::info("{}: left at {} FPS (excluded by allowlist or blocklist)", fileName, headerFPS);
-    } else if (frameRate == headerFPS) {
-        spdlog::info("{}: left at {} FPS (already at or above target)", fileName, headerFPS);
-    } else {
-        spdlog::info("{}: {} -> {} FPS", fileName, headerFPS, frameRate);
-    }
+    return s_loggedMovies.insert(fileName).second;
 }
 
 /**
@@ -151,8 +179,12 @@ void logMovieOnce(const std::string& fileName,
  * another one never set it, so only a menu's main movie gets here and everything it loads follows
  * it. The delta time is left alone on purpose: it also drives getTimer() and setInterval.
  *
+ * In interpolated mode the frame rate is left alone. SetLevelMovie runs before the movie's first
+ * frame, so this is where the movie is prepared for its tweens to be drawn between frames.
+ *
  * @param movieDef Movie being asked for its frame rate
- * @return Frame rate from the movie file, raised to the target if the movie is included
+ * @return Frame rate from the movie file, raised to the target if the movie is included and the
+ *         mode is fps
  */
 auto getFrameRateHook(const RE::GFxMovieDefImpl* movieDef) -> float
 {
@@ -160,12 +192,41 @@ auto getFrameRateHook(const RE::GFxMovieDefImpl* movieDef) -> float
 
     const char* url = movieDef->GetFileURL();
     const auto fileName = SpeedyUI::fileNameOf(url != nullptr ? url : "");
-
     const bool included = SpeedyUI::isIncluded(fileName, s_config.allowlist, s_config.blocklist);
-    const float frameRate = included ? std::max(headerFPS, s_config.targetFPS) : headerFPS;
 
-    logMovieOnce(fileName, headerFPS, frameRate, included);
-    return frameRate;
+    if (s_config.mode == Mode::INTERPOLATED) {
+        const auto summary = SpeedyUI::prepareMovie(*movieDef, fileName, included && s_smoothing);
+        if (!firstSighting(fileName)) {
+            return headerFPS;
+        }
+        if (!included) {
+            spdlog::info("{}: {} FPS, not smoothed (excluded by allowlist or blocklist)", fileName, headerFPS);
+        } else if (!s_smoothing) {
+            spdlog::info("{}: {} FPS, not smoothed (smoothing is unavailable)", fileName, headerFPS);
+        } else {
+            spdlog::info("{}: {} FPS, tweens smoothed in {} of {} timelines", fileName, headerFPS, summary.tweened, summary.timelines);
+        }
+        return headerFPS;
+    }
+
+    if (!included) {
+        if (firstSighting(fileName)) {
+            spdlog::info("{}: left at {} FPS (excluded by allowlist or blocklist)", fileName, headerFPS);
+        }
+        return headerFPS;
+    }
+
+    if (headerFPS >= s_config.targetFPS) {
+        if (firstSighting(fileName)) {
+            spdlog::info("{}: left at {} FPS (already at or above target)", fileName, headerFPS);
+        }
+        return headerFPS;
+    }
+
+    if (firstSighting(fileName)) {
+        spdlog::info("{}: {} -> {} FPS", fileName, headerFPS, s_config.targetFPS);
+    }
+    return s_config.targetFPS;
 }
 
 /**
@@ -212,13 +273,20 @@ SKSEPluginInfo(.Version = REL::Version {0,
     spdlog::info("{} {} loading (runtime {})", PLUGIN_NAME, PLUGIN_VERSION, version.string("."));
 
     s_config = loadConfig();
-    spdlog::info("bEnabled={} fTargetFPS={} allowlist entries={} blocklist entries={}",
+    spdlog::info("sMode={} bEnabled={} fTargetFPS={} allowlist entries={} blocklist entries={}",
+                 modeName(s_config.mode),
                  s_config.enabled,
                  s_config.targetFPS,
                  s_config.allowlist.size(),
                  s_config.blocklist.size());
 
     if (s_config.enabled) {
+        if (s_config.mode == Mode::INTERPOLATED) {
+            s_smoothing = SpeedyUI::initSmoothing();
+            if (!s_smoothing) {
+                spdlog::warn("sMode is interpolated but tweens cannot be smoothed, so menus play as they always have");
+            }
+        }
         installHook();
     }
 

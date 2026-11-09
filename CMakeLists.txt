@@ -31,11 +31,16 @@ add_subdirectory("extern/CommonLibSSE-NG" commonlibsse)
 
 set(headers
     "include/Filter.h"
+    "include/Interpolate.h"
     "include/PCH.h"
+    "include/Smoothing.h"
+    "include/Timeline.h"
 )
 
 set(sources
     "src/main.cpp"
+    "src/Smoothing.cpp"
+    "src/Timeline.cpp"
 )
 
 add_library(${PROJECT_NAME} SHARED ${headers} ${sources})
